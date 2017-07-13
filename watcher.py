@@ -299,7 +299,6 @@ class WatcherDaemon(Daemon):
 
     def _parseMask(self, masks):
         ret = False;
-
         for mask in masks:
             mask = mask.strip()
 
