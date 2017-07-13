@@ -1,5 +1,7 @@
 #!/usr/bin/env python
+
 # Copyright (c) 2010 Greggory Hernandez
+# Modified work Copyright 2017 Umar Nawawi
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -19,22 +21,27 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+### http://github.com/seb-m/pyinotify/wiki
+# Provides:          watcher.py
+# Required-Start:    $remote_fs $syslog
+# Required-Stop:     $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Monitor directories for file changes
+# Description:       Monitor directories specified in /etc/config.ini for
+#                    changes using the Kernel's inotify mechanism and run
+#                    jobs when files or directories change
+
 import sys, os, time, atexit
 from signal import SIGTERM
 import pyinotify
 import sys, os
 import datetime
 import subprocess
-import shlex
-import re
 from types import *
 from string import Template
-from yaml import load, dump # load is for read yaml, dump is for writing
-try:
-    from yaml import CLoader as Loader
-    from yaml import CDumper as Dumper
-except ImportError:
-    from yaml import Loader, Dumper
+import ConfigParser
+import argparse
 
 class Daemon:
     """
@@ -155,6 +162,21 @@ class Daemon:
         self.stop()
         self.start()
 
+    def status(self):
+        try:
+            pf = file(self.pidfile, 'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+            
+        if pid:
+            print "service running"
+            sys.exit(0)
+        if not pid:
+            print "service not running"
+            sys.exit(3)
+
     def run(self):
         """
         You should override this method when you subclass Daemon. It will be called after the process has been
@@ -162,69 +184,26 @@ class Daemon:
         """
 
 class EventHandler(pyinotify.ProcessEvent):
-    def __init__(self, command, recursive, exclude, mask, parent, prefix, root):
+    def __init__(self, command):
         pyinotify.ProcessEvent.__init__(self)
-        self.command = command     #the command to be run
-        self.recursive = recursive #watch recursively?
-        self.exclude = exclude      #path to exclude
-        self.mask = mask           #the watch mask
-        self.parent = parent       #should be calling instance of WatcherDaemon
-        self.prefix = prefix       #prefix to handle recursively watching new dirs
-        self.root = root           #root of watch (actually used to calculate subdirs)
-        self.move_map = {}
+        self.command = command
 
-    def runCommand(self, event, ignore_cookie=True):
+    # from http://stackoverflow.com/questions/35817/how-to-escape-os-system-calls-in-python
+    def shellquote(self,s):
+        s = str(s)
+        return "'" + s.replace("'", "'\\''") + "'"
+
+    def runCommand(self, event):
         t = Template(self.command)
-        sub_regex = self.root
-
-        #build the dest_file
-        dfile = event.name
-        if self.prefix != "":
-            dfile = self.prefix + '/' + dfile
-        elif self.root != "":
-            if event.path != self.root:
-                sub_regex = self.root+os.sep
-            dfile = re.sub('^'+re.escape(sub_regex),'',event.path) + os.sep + dfile
-
-        #find the src_path if it exists
-        src_path = ''
-        src_rel_path = ''
-        if not ignore_cookie and hasattr(event, 'cookie') and event.cookie in self.move_map:
-            src_path = self.move_map[event.cookie]
-            if self.root != "":
-                src_rel_path = re.sub('^'+re.escape(sub_regex), '', src_path)
-            del self.move_map[event.cookie]
-
-        #run substitutions on the command
-        command = t.safe_substitute({
-                'watched': event.path,
-                'filename': event.pathname,
-                'dest_file': dfile,
-                'tflags': event.maskname,
-                'nflags': event.mask,
-                'src_path': src_path,
-                'src_rel_path': src_rel_path,
-                'datetime': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                })
-
-        #try the command
+        command = t.substitute(watched=self.shellquote(event.path),
+                               filename=self.shellquote(event.pathname),
+                               tflags=self.shellquote(event.maskname),
+                               nflags=self.shellquote(event.mask),
+                               cookie=self.shellquote(event.cookie if hasattr(event, "cookie") else 0))
         try:
-            subprocess.call(shlex.split(command))
+            os.system(command)
         except OSError, err:
             print "Failed to run command '%s' %s" % (command, str(err))
-
-        #handle recursive watching of directories
-        if self.recursive and os.path.isdir(event.pathname):
-
-            prefix = event.name
-            if self.prefix != "":
-                prefix = self.prefix + '/' + prefix
-            self.parent.addWatch(self.mask,
-                                 event.pathname,
-                                 self.exclude,
-                                 True,
-                                 self.command,
-                                 prefix)
 
     def process_IN_ACCESS(self, event):
         print "Access: ", event.pathname
@@ -260,80 +239,73 @@ class EventHandler(pyinotify.ProcessEvent):
 
     def process_IN_MOVED_FROM(self, event):
         print "Moved from: ", event.pathname
-        self.move_map[event.cookie] = event.pathname
         self.runCommand(event)
 
     def process_IN_MOVED_TO(self, event):
         print "Moved to: ", event.pathname
-        self.runCommand(event, False)
+        self.runCommand(event)
 
     def process_IN_OPEN(self, event):
         print "Opened: ", event.pathname
         self.runCommand(event)
 
 class WatcherDaemon(Daemon):
+
+    def __init__(self, config):
+        self.stdin   = '/dev/null'
+        self.stdout  = config.get('DEFAULT','logfile')
+        self.stderr  = config.get('DEFAULT','logfile')
+        self.pidfile = config.get('DEFAULT','pidfile')
+        self.config  = config
+
     def run(self):
-        print datetime.datetime.today()
+        log('Daemon started')
+        wdds      = []
+        notifiers = []
 
-        dir = self._loadWatcherDirectory()
-        jobs_file = file(dir + '/jobs.yml', 'r')
-        self.wdds = []
-        self.notifiers = []
+        # read jobs from config file
+        for section in self.config.sections():
+            log(section + ": " + self.config.get(section,'watch'))
+            # get the basic config info
+            mask      = self._parseMask(self.config.get(section,'events').split(','))
+            folder    = self.config.get(section,'watch')
+            recursive = self.config.getboolean(section,'recursive')
+            autoadd   = self.config.getboolean(section,'autoadd')
+            excluded  = self.config.get(section,'excluded')
+            command   = self.config.get(section,'command')
 
-        # parse jobs.yml and add_watch/notifier for each entry
-        print jobs_file
-        jobs = load(jobs_file, Loader=Loader)
-        if jobs is not None:
-            for job in jobs.iteritems():
-                sys.stdout.write(job[0] + "\n")
-                # get the basic config info
-                
-                mask = self._parseMask(job[1]['events'])
-                folder = job[1]['watch']
-                exclude = job[1]['exclude']
-                recursive = job[1]['recursive']
-                command = job[1]['command']
+            # Exclude directories right away if 'excluded' regexp is set
+            # Example https://github.com/seb-m/pyinotify/blob/master/python2/examples/exclude.py
+            if excluded.strip() == '':   # if 'excluded' is empty or whitespaces only
+                excl = None
+            else:
+                excl = pyinotify.ExcludeFilter(excluded.split(','))
 
-                self.addWatch(mask, folder, exclude, recursive, command)
+            wm = pyinotify.WatchManager()
+            handler = EventHandler(command)
 
-    def addWatch(self, mask, folder, exclude, recursive, command, prefix=""):
-        wm = pyinotify.WatchManager()
-        handler = EventHandler(command, recursive, exclude, mask, self, prefix, folder)
-        
-        # adding exclusion list
-        excl_lst = exclude
-        excl = pyinotify.ExcludeFilter(excl_lst)
+            wdds.append(wm.add_watch(folder, mask, rec=recursive, auto_add=autoadd, exclude_filter=excl))
 
-        self.wdds.append(wm.add_watch(folder, mask, rec=recursive, exclude_filter=excl))
-        # BUT we need a new ThreadNotifier so I can specify a different
-        # EventHandler instance for each job
-        # this means that each job has its own thread as well (I think)
-        n = pyinotify.ThreadedNotifier(wm, handler)
-        self.notifiers.append(pyinotify.ThreadedNotifier(wm, handler))
-        n.start()
+            # BUT we need a new ThreadNotifier so I can specify a different
+            # EventHandler instance for each job
+            # this means that each job has its own thread as well (I think)
+            notifiers.append(pyinotify.ThreadedNotifier(wm, handler))
 
-    def _loadWatcherDirectory(self):
-        watcher_dir = defineWatcherDirectory()
-        jobs_file = watcher_dir + '/jobs.yml'
+        # now we need to start ALL the notifiers.
+        # TODO: load test this ... is having a thread for each a problem?
+        for notifier in notifiers:
+            notifier.start()
 
-        if not os.path.isdir(watcher_dir):
-            # create directory
-            os.mkdir(watcher_dir)
-
-        if not os.path.isfile(jobs_file):
-            # create jobs.yml
-            f = open(jobs_file, 'w')
-            f.close()
-
-        return watcher_dir
 
     def _parseMask(self, masks):
         ret = False;
 
         for mask in masks:
+            mask = mask.strip()
+
             if 'access' == mask:
                 ret = self._addMask(pyinotify.IN_ACCESS, ret)
-            elif 'atrribute_change' == mask:
+            elif 'attribute_change' == mask:
                 ret = self._addMask(pyinotify.IN_ATTRIB, ret)
             elif 'write_close' == mask:
                 ret = self._addMask(pyinotify.IN_CLOSE_WRITE, ret)
@@ -374,45 +346,52 @@ class WatcherDaemon(Daemon):
         else:
             return current_options | new_option
 
-def defineWatcherDirectory():
-    return os.path.expanduser('~') + '/.watcher'
+
+
+def log(msg):
+    sys.stdout.write("%s %s\n" % ( str(datetime.datetime.now()), msg ))
+
 
 if __name__ == "__main__":
-    watcher_dir = defineWatcherDirectory()
-    try:
-        os.mkdir(watcher_dir)
-    except OSError:
-        pass
+    # Parse commandline arguments
+    parser = argparse.ArgumentParser(
+                description='A daemon to monitor changes within specified directories and run commands on these changes.',
+             )
+    parser.add_argument('-c','--config',
+                        action='store',
+                        help='Path to the config file (default: %(default)s)')
+    parser.add_argument('command',
+                        action='store',
+                        choices=['start','stop','restart','status','debug'],
+                        help='What to do. Use debug to start in the foreground')
+    args = parser.parse_args()
 
-    log = watcher_dir + '/watcher.log'
-    pidfile = watcher_dir + '/watcher.pid'
-    # create the log
-    f = open(log, 'w')
-    f.close()
+    # Parse the config file
+    config = ConfigParser.ConfigParser()
+    if(args.config):
+        confok = config.read(args.config)
+    else:
+        confok = config.read(['/etc/config.ini', os.path.expanduser('~/.config.ini')]);
 
-    try:
-        # TODO: make stdout and stderr neutral location
-        daemon = WatcherDaemon(pidfile, stdout=log, stderr=log)
-        if len(sys.argv) == 2:
-            if 'start' == sys.argv[1]:
-                f = open(log, 'w')
-                f.close()
-                daemon.start()
-            elif 'stop' == sys.argv[1]:
-                os.remove(log)
-                daemon.stop()
-            elif 'restart' == sys.argv[1]:
-                daemon.restart()
-            elif 'debug' == sys.argv[1]:
-                daemon.run()
-            else:
-                print "Unkown Command"
-                sys.exit(2)
-            sys.exit(0)
-        else:
-            print "Usage: %s start|stop|restart|debug" % sys.argv[0]
-            sys.exit(2)
-    except Exception, e:
-        print e
-        os.remove(log)
-        raise
+    if(not confok):
+        sys.stderr.write("Failed to read config file. Try -c parameter\n")
+        sys.exit(4);
+
+    # Initialize the daemon
+    daemon = WatcherDaemon(config)
+
+    # Execute the command
+    if 'start' == args.command:
+        daemon.start()
+    elif 'stop' == args.command:
+        daemon.stop()
+    elif 'restart' == args.command:
+        daemon.restart()
+    elif 'status' == args.command:
+        daemon.status()
+    elif 'debug' == args.command:
+        daemon.run()
+    else:
+        print "Unkown Command"
+        sys.exit(2)
+    sys.exit(0)
